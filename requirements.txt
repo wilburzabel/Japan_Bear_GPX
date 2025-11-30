@@ -1,7 +1,7 @@
 streamlit
-folium
-streamlit-folium
-pandas
 gpxpy
 requests
-geopy
+pandas
+shapely
+folium
+streamlit-folium
