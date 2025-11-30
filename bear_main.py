@@ -5,9 +5,11 @@ import pandas as pd
 from shapely.geometry import Point, LineString
 from streamlit_folium import st_folium
 import folium
+from folium.plugins import FastMarkerCluster
+import datetime
 
 # --- 页面基础配置 ---
-st.set_page_config(page_title="熊出没路径检测器", layout="wide", page_icon="🐻")
+st.set_page_config(page_title="熊出没可视化地图", layout="wide", page_icon="🐻")
 
 # --- 核心函数：加载并清洗数据 ---
 @st.cache_data
@@ -16,41 +18,83 @@ def load_bear_data(filepath):
         with open(filepath, 'r', encoding='utf-8') as f:
             raw_data = json.load(f)
         
-        # 1. 关键修改：从 'result' 键中提取列表
         if 'result' not in raw_data:
-            st.error("JSON 文件结构不正确：找不到 'result' 字段。")
+            st.error("数据结构错误：找不到 'result' 字段。")
             return pd.DataFrame()
             
         df = pd.DataFrame(raw_data['result'])
         
-        # 2. 确保经纬度是数字类型 (防止 JSON 里偶尔混入字符串)
+        # 1. 经纬度清洗
         df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
         df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
-        
-        # 删除经纬度无效的脏数据
         df = df.dropna(subset=['latitude', 'longitude'])
+        
+        # 2. 时间解析 (这是新增的关键步骤)
+        # 将字符串转换为 datetime 对象，以便进行日期比较
+        df['sighting_datetime'] = pd.to_datetime(df['sighting_datetime'], errors='coerce')
         
         return df
     except Exception as e:
         st.error(f"读取文件失败: {e}")
         return pd.DataFrame()
 
-# --- 主界面逻辑 ---
-st.title("🐻 熊出没路径检测器")
-st.markdown("上传 GPX 轨迹文件，自动检测路径 **500米范围内** 的历史熊出没记录。")
+# --- 主逻辑 ---
 
-# 加载数据 (确保文件名和你保存的一致，比如 bears.json)
-bear_df = load_bear_data("bears.json") 
+# 1. 加载全量数据
+bear_df = load_bear_data("bears.json")
 
-if not bear_df.empty:
-    st.success(f"📚 本地数据库已加载：包含 {len(bear_df)} 条目击记录。")
+if bear_df.empty:
+    st.stop()
+
+# --- 侧边栏：全局过滤器 ---
+with st.sidebar:
+    st.header("🔍 筛选条件")
+    
+    # 获取数据中的最早和最晚时间
+    min_date = bear_df['sighting_datetime'].min().date()
+    max_date = bear_df['sighting_datetime'].max().date()
+    
+    # 时间范围选择器 (默认显示最近一年的数据，避免数据量过大干扰视线)
+    default_start = max_date - datetime.timedelta(days=365)
+    
+    date_range = st.date_input(
+        "选择目击时间范围",
+        value=(default_start, max_date),
+        min_value=min_date,
+        max_value=max_date
+    )
+    
+    # 简单的容错处理，防止用户只选了一个日期报错
+    if len(date_range) == 2:
+        start_date, end_date = date_range
+    else:
+        start_date, end_date = date_range[0], date_range[0]
+
+# --- 根据时间筛选数据 ---
+# 这一步过滤了全量数据，后续的所有地图展示都基于这个 filtered_df
+filtered_df = bear_df[
+    (bear_df['sighting_datetime'].dt.date >= start_date) & 
+    (bear_df['sighting_datetime'].dt.date <= end_date)
+].copy()
+
+st.title("🐻 熊出没可视化地图")
+st.markdown(f"当前显示 **{start_date}** 至 **{end_date}** 期间的 **{len(filtered_df)}** 条记录。")
+
+# GPX 上传组件
+uploaded_file = st.file_uploader("📂 上传 GPX 路线进行碰撞检测 (可选)", type=['gpx'])
+
+# --- 地图生成逻辑 ---
+
+# 默认中心点：如果没有 GPX，就用筛选后数据的平均位置；如果没有数据，就定在东京
+if not filtered_df.empty:
+    map_center = [filtered_df['latitude'].mean(), filtered_df['longitude'].mean()]
 else:
-    st.stop() # 如果没数据，就暂停运行下面的代码
+    map_center = [35.6895, 139.6917] 
 
-uploaded_file = st.file_uploader("📂 请上传 GPX 文件", type=['gpx'])
+m = folium.Map(location=map_center, zoom_start=6 if uploaded_file is None else 12)
 
+# 情况 A: 用户上传了 GPX (进入详细检测模式)
 if uploaded_file is not None:
-    # 1. 解析用户上传的 GPX
     gpx = gpxpy.parse(uploaded_file)
     points = []
     for track in gpx.tracks:
@@ -59,70 +103,62 @@ if uploaded_file is not None:
                 points.append((point.latitude, point.longitude))
     
     if points:
-        # 构建路线和缓冲区
-        route_line = LineString(points)
-        buffer_distance_deg = 0.005  # 约 500米
-        route_buffer = route_line.buffer(buffer_distance_deg)
-        
-        # 获取路线边界用于快速粗筛
-        min_lon, min_lat, max_lon, max_lat = route_buffer.bounds
-        
-        # 2. 粗筛 (Bounding Box Filter) - 极大提升性能
-        # 使用你提供的字段名：latitude, longitude
-        candidates = bear_df[
-            (bear_df['latitude'] >= min_lat) & (bear_df['latitude'] <= max_lat) &
-            (bear_df['longitude'] >= min_lon) & (bear_df['longitude'] <= max_lon)
-        ].copy()
-        
-        # 3. 精细几何检测
-        dangerous_bears = []
-        for idx, row in candidates.iterrows():
-            bear_point = Point(row['latitude'], row['longitude'])
-            if route_buffer.contains(bear_point):
-                dangerous_bears.append(row)
-        
-        # 4. 地图可视化
-        # 初始化地图中心为路线起点
-        m = folium.Map(location=points[0], zoom_start=13)
-        
-        # 画路线
+        # 1. 画路线
         folium.PolyLine(points, color="#3388ff", weight=4, opacity=0.8, tooltip="徒步路线").add_to(m)
         
-        # 画危险点
+        # 2. 空间计算 (只计算时间筛选后的数据)
+        route_line = LineString(points)
+        route_buffer = route_line.buffer(0.005) # 500m
+        min_lon, min_lat, max_lon, max_lat = route_buffer.bounds
+        
+        # 粗筛
+        candidates = filtered_df[
+            (filtered_df['latitude'] >= min_lat) & (filtered_df['latitude'] <= max_lat) &
+            (filtered_df['longitude'] >= min_lon) & (filtered_df['longitude'] <= max_lon)
+        ]
+        
+        dangerous_bears = []
+        for idx, row in candidates.iterrows():
+            if route_buffer.contains(Point(row['latitude'], row['longitude'])):
+                dangerous_bears.append(row)
+        
+        # 3. 标记危险点 (红色高亮)
         for bear in dangerous_bears:
-            # 组合提示信息
-            date_str = str(bear.get('sighting_datetime', '未知时间'))
-            loc_str = str(bear.get('municipality_name', '')) + str(bear.get('address', ''))
-            condition = str(bear.get('sighting_condition', '无详细描述'))
-            
-            # 弹窗内容 (支持 HTML 换行)
-            popup_html = f"""
-            <b>时间:</b> {date_str}<br>
-            <b>地点:</b> {loc_str}<br>
-            <b>详情:</b> {condition}
-            """
-            
+            date_str = bear['sighting_datetime'].strftime('%Y-%m-%d %H:%M')
+            popup_html = f"<b>{date_str}</b><br>{bear.get('sighting_condition', '')}"
             folium.Marker(
                 [bear['latitude'], bear['longitude']],
-                popup=folium.Popup(popup_html, max_width=300),
-                icon=folium.Icon(color="red", icon="paw", prefix='fa') # 使用爪子图标
+                popup=folium.Popup(popup_html, max_width=250),
+                icon=folium.Icon(color="red", icon="paw", prefix='fa')
             ).add_to(m)
             
-        st_folium(m, width=800)
+        # 调整地图视野以适应路线
+        m.fit_bounds(route_line.bounds)
         
-        # 5. 结果展示
-        if len(dangerous_bears) > 0:
-            st.error(f"⚠️ 警告：在路线周边发现 {len(dangerous_bears)} 次目击记录！")
-            
-            # 整理一个漂亮的表格展示给用户
-            display_df = pd.DataFrame(dangerous_bears)[
-                ['sighting_datetime', 'municipality_name', 'address', 'sighting_condition']
-            ]
-            # 重命名列头，方便阅读
-            display_df.columns = ['目击时间', '市町村', '详细地址', '目击详情']
-            st.dataframe(display_df, hide_index=True)
+        if dangerous_bears:
+            st.error(f"⚠️ 在路线周边发现 {len(dangerous_bears)} 条记录！")
         else:
-            st.success("✅ 也就是两棵树，一棵没有熊，另一棵也没有熊。（路线周边暂无记录）")
-            
-    else:
-        st.warning("GPX 文件中似乎没有路径点，请检查文件。")
+            st.success("✅ 该时间段内，路线周边无记录。")
+
+# 情况 B: 用户没有上传 GPX (进入全景探索模式)
+else:
+    # 使用 FastMarkerCluster 进行聚合显示，防止浏览器卡顿
+    if not filtered_df.empty:
+        # 提取经纬度列表
+        locations = filtered_df[['latitude', 'longitude']].values.tolist()
+        
+        # 这里的 callback 可以自定义点击聚合点时的行为，这里我们直接显示聚合
+        FastMarkerCluster(data=locations).add_to(m)
+        
+        st.info("💡 提示：地图显示的是全区域数据，上传 GPX 文件可进行路线周边的精确检测。")
+
+# 最后渲染地图
+st_folium(m, width=1000, height=600)
+
+# 如果有危险记录，显示详情列表
+if uploaded_file is not None and 'dangerous_bears' in locals() and dangerous_bears:
+    st.subheader("📋 详细记录")
+    display_df = pd.DataFrame(dangerous_bears)[
+        ['sighting_datetime', 'municipality_name', 'address', 'sighting_condition']
+    ]
+    st.dataframe(display_df, hide_index=True)
