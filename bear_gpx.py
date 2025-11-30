@@ -4,224 +4,175 @@ from streamlit_folium import st_folium
 import pandas as pd
 import gpxpy
 import requests
-import re
-from datetime import datetime
 from geopy.distance import geodesic
 from folium.plugins import MarkerCluster
+from datetime import datetime, timedelta
 
-# --- 页面配置 ---
-st.set_page_config(page_title="日本熊出没地图 (TV Asahi版)", layout="wide")
+st.set_page_config(page_title="日本熊出没 (云端版)", layout="wide")
+st.title("🐻 日本熊出没地图 (云端部署版)")
 
-st.title("🐻 日本熊出没地图 - 2025特别版")
-st.markdown("数据来源：[朝日电视台 熊出没专题](https://news.tv-asahi.co.jp/special/202506bear/) | 自动同步最新 JSON 数据")
-
-# --- 1. 数据获取与解析 ---
-
-@st.cache_data(ttl=3600)  # 缓存1小时
-def load_tvasahi_data():
-    url = "https://news.tv-asahi.co.jp/special/202506bear/sys/data.json"
+# --- 1. 从 Secrets 读取 Cookie (更安全) ---
+def get_headers_from_secrets():
+    """从 Streamlit 后台配置读取 Cookie，防止代码泄露"""
     try:
-        response = requests.get(url, timeout=10)
-        if response.status_code != 200:
-            st.error("无法连接到数据源")
-            return pd.DataFrame()
-        
-        json_data = response.json()
-        markers = json_data.get('marker', [])
-        
-        data = []
-        # 正则表达式用于从标题提取日期：例如 "【2025年8月25日】..."
-        date_pattern = re.compile(r"【(\d+)年(\d+)月(\d+)日】")
+        # 必须在 Streamlit Cloud 后台设置这些 secrets
+        return {
+            'cookies': {
+                'XSRF-TOKEN': st.secrets["kumadas_cookies"]["XSRF_TOKEN"],
+                '_session': st.secrets["kumadas_cookies"]["SESSION"],
+                # 其他必要的 cookie...
+            },
+            'headers': {
+                'x-csrf-token': st.secrets["kumadas_headers"]["CSRF_TOKEN"],
+                'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ...',
+                'content-type': 'application/json',
+                'origin': 'https://kumadas.net',
+                'referer': 'https://kumadas.net/'
+            }
+        }
+    except Exception:
+        return None
 
-        for item in markers:
-            # 1. 过滤无效数据 (调整用Pin通常纬度很高或标题含特定词)
-            if "調整用" in item.get('title', '') or float(item.get('latitude', 0)) > 80:
-                continue
+# --- 2. 数据抓取逻辑 ---
+@st.cache_data(ttl=300)
+def fetch_online_data(start_date, end_date):
+    # 尝试读取 Secrets
+    config = get_headers_from_secrets()
+    
+    if not config:
+        st.error("❌ 未配置 Secrets！请在 Streamlit 后台填入 Cookie。")
+        return None
 
-            # 2. 提取日期
-            title = item.get('title', '')
-            match = date_pattern.search(title)
-            if match:
-                try:
-                    year, month, day = map(int, match.groups())
-                    date_obj = datetime(year, month, day).date()
-                except:
-                    date_obj = None
-            else:
-                date_obj = None
+    url = 'https://kumadas.net/api/ver1/sightings/post_list'
+    
+    json_data = {
+        'lat': 38.00, 'lng': 137.00,
+        'filter': {
+            'radius': '3000',
+            'info_type_ids': ['1', '2', '3', '4'],
+            'animal_species_ids': ['1'],
+            'municipality_ids': [],
+            'startdate': start_date.strftime("%Y-%m-%d"),
+            'enddate': end_date.strftime("%Y-%m-%d"),
+        },
+    }
 
-            # 3. 整理数据
-            data.append({
-                "date": date_obj,
-                "title": title,
-                "desc": item.get('description', ''),
-                "lat": float(item.get('latitude')),
-                "lon": float(item.get('longitude')),
-                "url": item.get('link_url', '')
-            })
+    try:
+        resp = requests.post(
+            url, 
+            cookies=config['cookies'], 
+            headers=config['headers'], 
+            json=json_data, 
+            timeout=20
+        )
+        if resp.status_code == 200:
+            items = resp.json()
+            if isinstance(items, dict): items = items.get('data', [])
             
-        df = pd.DataFrame(data)
-        # 删除没有日期的脏数据
-        df = df.dropna(subset=['date'])
-        return df
-
+            cleaned = []
+            for item in items:
+                lat = item.get('lat') or item.get('latitude')
+                lon = item.get('lng') or item.get('longitude')
+                d_str = item.get('sighted_at') or item.get('created_at')
+                if lat and lon and d_str:
+                    cleaned.append({
+                        "date": d_str, # 先存字符串，后面转
+                        "lat": float(lat),
+                        "lon": float(lon),
+                        "desc": item.get('body', '无描述'),
+                        "place": item.get('place_name', '')
+                    })
+            return pd.DataFrame(cleaned)
     except Exception as e:
-        st.error(f"数据解析错误: {e}")
-        return pd.DataFrame()
+        st.error(f"连接错误: {e}")
+    return None
 
-def parse_gpx(uploaded_file):
-    """解析GPX文件"""
-    if uploaded_file is not None:
-        try:
-            gpx = gpxpy.parse(uploaded_file)
-            points = []
-            for track in gpx.tracks:
-                for segment in track.segments:
-                    for point in segment.points:
-                        points.append((point.latitude, point.longitude))
-            return points
-        except:
-            st.error("GPX文件解析失败")
-    return []
+# --- 3. GPX 解析 ---
+def parse_gpx(file):
+    try:
+        gpx = gpxpy.parse(file)
+        return [(p.latitude, p.longitude) for t in gpx.tracks for s in t.segments for p in s.points]
+    except: return []
 
-def check_proximity(route_points, bear_df, threshold_km=1.0):
-    """检测路线风险"""
-    dangers = []
-    # 抽样检查路线点以提高速度 (每50个点查一次)
-    sampled_route = route_points[::50] 
+# --- 4. 主界面逻辑 ---
+
+# 侧边栏：选择数据源
+st.sidebar.header("📡 数据源")
+data_mode = st.sidebar.radio("选择模式", ["在线抓取 (需有效Cookie)", "上传历史备份 (离线)"])
+
+df_bears = pd.DataFrame()
+
+if data_mode == "在线抓取 (需有效Cookie)":
+    s_date = st.sidebar.date_input("开始日期", datetime.now().date() - timedelta(days=30))
+    e_date = st.sidebar.date_input("结束日期", datetime.now().date())
     
-    # 如果路线点太少，就全部检查
-    if len(route_points) < 50:
-        sampled_route = route_points
-
-    for _, bear in bear_df.iterrows():
-        bear_loc = (bear['lat'], bear['lon'])
-        for route_pt in sampled_route:
-            if geodesic(bear_loc, route_pt).km <= threshold_km:
-                dangers.append(bear)
-                break
-    return pd.DataFrame(dangers)
-
-# --- 2. 程序主逻辑 ---
-
-# 加载数据
-with st.spinner("正在从朝日电视台服务器获取最新数据..."):
-    df_bears = load_tvasahi_data()
-
-if df_bears.empty:
-    st.warning("未能获取到数据，请检查网络连接。")
-    st.stop()
-
-# 侧边栏控制
-st.sidebar.header("📅 筛选与设置")
-
-# 日期滑块
-min_date = df_bears['date'].min()
-max_date = df_bears['date'].max()
-
-start_date, end_date = st.sidebar.date_input(
-    "选择时间范围",
-    [min_date, max_date],
-    min_value=min_date,
-    max_value=max_date
-)
-
-# 根据日期过滤
-filtered_data = df_bears[
-    (df_bears['date'] >= start_date) & 
-    (df_bears['date'] <= end_date)
-]
-
-st.sidebar.success(f"显示记录: {len(filtered_data)} / {len(df_bears)} 条")
-
-# GPX 上传
-uploaded_file = st.sidebar.file_uploader("📂 上传GPX路线文件", type=['gpx'])
-safe_distance = st.sidebar.slider("🔴 警戒半径 (km)", 0.5, 5.0, 1.0)
-
-# --- 3. 地图绘制 ---
-
-# 默认中心设为最新的一个点，或者日本中心
-if not filtered_data.empty:
-    center_lat = filtered_data.iloc[0]['lat']
-    center_lon = filtered_data.iloc[0]['lon']
-else:
-    center_lat, center_lon = 36.2048, 138.2529 # 日本大概中心
-
-m = folium.Map(location=[center_lat, center_lon], zoom_start=6, tiles="OpenStreetMap")
-
-# 绘制熊点 (使用聚类插件防止卡顿)
-marker_cluster = MarkerCluster().add_to(m)
-
-for _, row in filtered_data.iterrows():
-    # 构建弹出内容
-    popup_html = f"""
-    <b>日期:</b> {row['date']}<br>
-    <b>地点:</b> {row['title']}<br>
-    <div style='width:200px; white-space:normal;'>{row['desc']}</div>
-    """
-    
-    folium.Marker(
-        location=[row['lat'], row['lon']],
-        popup=folium.Popup(popup_html, max_width=300),
-        icon=folium.Icon(color="red", icon="paw", prefix='fa')
-    ).add_to(marker_cluster)
-
-# GPX 路线与风险分析
-danger_bears = pd.DataFrame()
-
-if uploaded_file:
-    route_points = parse_gpx(uploaded_file)
-    if route_points:
-        # 画路线
-        folium.PolyLine(route_points, color="blue", weight=5, opacity=0.7).add_to(m)
-        
-        # 调整视角到路线起点
-        m.location = route_points[0]
-        m.zoom_start = 12
-        
-        # 计算风险
-        danger_bears = check_proximity(route_points, filtered_data, safe_distance)
-        
-        # 高亮危险熊点
-        if not danger_bears.empty:
-            for _, row in danger_bears.iterrows():
-                folium.Circle(
-                    location=[row['lat'], row['lon']],
-                    radius=safe_distance * 1000,
-                    color="crimson",
-                    fill=True,
-                    fill_opacity=0.3,
-                    popup="⚠️ 警戒：路线上有熊"
-                ).add_to(m)
-
-# --- 4. 显示界面 ---
-
-col1, col2 = st.columns([3, 1])
-
-with col1:
-    st_folium(m, width="100%", height=700)
-
-with col2:
-    st.subheader("📊 风险分析报告")
-    
-    if uploaded_file:
-        if not danger_bears.empty:
-            st.error(f"⚠️ 警告！路线上发现 {len(danger_bears)} 处风险记录！")
-            st.markdown(f"**警戒半径 {safe_distance}km 内的目击记录：**")
+    if st.sidebar.button("开始抓取"):
+        with st.spinner("正在连接 Kumadas..."):
+            df_bears = fetch_online_data(s_date, e_date)
             
-            for _, row in danger_bears.iterrows():
-                with st.expander(f"{row['date']} - {row['title'][:10]}..."):
-                    st.write(row['desc'])
-                    if row['url']:
-                        st.markdown(f"[查看新闻链接]({row['url']})")
-        else:
-            st.success("✅ 您的路线在所选时间段内相对安全。")
-    else:
-        st.info("👈 请在左侧上传 GPX 文件以检测路线安全。")
-        
-    st.markdown("---")
-    st.markdown("### 最近5条全境记录")
-    # 显示最近的几条记录供参考
-    recent = filtered_data.sort_values(by='date', ascending=False).head(5)
-    for _, row in recent.iterrows():
-        st.text(f"{row['date']} {row['title'][:15]}...")
+        if df_bears is not None and not df_bears.empty:
+            st.success(f"✅ 成功抓取 {len(df_bears)} 条数据！")
+            
+            # ✨ 关键点：提供下载按钮来实现“持久化”
+            csv = df_bears.to_csv(index=False).encode('utf-8')
+            st.sidebar.download_button(
+                label="💾 下载数据备份 (以便下次使用)",
+                data=csv,
+                file_name='kumadas_backup.csv',
+                mime='text/csv',
+            )
+
+elif data_mode == "上传历史备份 (离线)":
+    backup_file = st.sidebar.file_uploader("📂 上传之前的 kumadas_backup.csv", type=['csv'])
+    if backup_file:
+        df_bears = pd.read_csv(backup_file)
+        st.sidebar.success(f"已加载离线数据: {len(df_bears)} 条")
+
+# 统一处理数据
+if not df_bears.empty:
+    df_bears['date'] = pd.to_datetime(df_bears['date']).dt.date
+    
+    # 地图展示 (限制显示数量防止卡顿)
+    m = folium.Map(location=[36.0, 138.0], zoom_start=5)
+    mc = MarkerCluster().add_to(m)
+    
+    # 只显示最近的 1000 个点，避免浏览器崩溃
+    for _, row in df_bears.head(1000).iterrows():
+        folium.Marker(
+            [row['lat'], row['lon']], 
+            popup=f"{row['date']}\n{row['place']}",
+            icon=folium.Icon(color='red', icon='paw', prefix='fa')
+        ).add_to(mc)
+
+    # GPX 上传与分析
+    gpx_file = st.sidebar.file_uploader("上传 GPX 检测风险", type=['gpx'])
+    safe_dist = st.sidebar.slider("风险半径 (km)", 0.5, 5.0, 1.0)
+    
+    if gpx_file:
+        pts = parse_gpx(gpx_file)
+        if pts:
+            folium.PolyLine(pts, color="blue", weight=4).add_to(m)
+            
+            # 风险计算 (使用全部数据)
+            risks = []
+            sampled_route = pts[::20] if len(pts) > 50 else pts
+            for _, b in df_bears.iterrows():
+                b_loc = (b['lat'], b['lon'])
+                for r in sampled_route:
+                    if geodesic(b_loc, r).km <= safe_dist:
+                        risks.append(b)
+                        break
+            
+            if risks:
+                risk_df = pd.DataFrame(risks)
+                st.error(f"⚠️ 路线上发现 {len(risk_df)} 个风险点！")
+                st.dataframe(risk_df)
+                for _, r in risk_df.iterrows():
+                    folium.Circle([r['lat'], r['lon']], radius=safe_dist*1000, color='crimson', fill=True).add_to(m)
+            else:
+                st.success("✅ 路线安全")
+
+    st_folium(m, width="100%", height=600)
+
+else:
+    st.info("👈 请在左侧选择模式：如果Cookie有效则【在线抓取】，如果失效则【上传】之前的备份文件。")
