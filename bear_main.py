@@ -20,7 +20,7 @@ st.title("🐻 熊出没安全地图 (2022-2025 全量数据)")
 def load_yamanashi_data():
     url = "https://catalog.dataplatform-yamanashi.jp/api/action/datastore_search"
     
-    # 这里的列表包含了你提供的所有 ID
+    # 包含最新和历史数据的 Resource ID 列表
     resource_ids = [
         "b4eb262f-07e0-4417-b24f-6b15844b4ac1", # 2024-2025 (最新)
         "62796404-c80f-47d6-ae88-222f844ee958", # 2023 (历史)
@@ -29,9 +29,8 @@ def load_yamanashi_data():
     
     all_frames = []
     
-    # 循环获取所有 ID 的数据
     for rid in resource_ids:
-        params = {"resource_id": rid, "limit": 10000} # 确保拿全
+        params = {"resource_id": rid, "limit": 10000}
         try:
             response = requests.get(url, params=params, timeout=10)
             data = response.json()
@@ -39,7 +38,7 @@ def load_yamanashi_data():
             if 'result' in data and 'records' in data['result']:
                 df = pd.DataFrame(data['result']['records'])
                 
-                # 字段名映射 (涵盖不同年份可能的写法)
+                # 字段名映射
                 rename_map = {
                     '緯度': 'latitude', '纬度': 'latitude', 'Lat': 'latitude', 'LAT': 'latitude',
                     '経度': 'longitude', '经度': 'longitude', 'Lon': 'longitude', 'LON': 'longitude',
@@ -47,23 +46,21 @@ def load_yamanashi_data():
                 }
                 df = df.rename(columns=rename_map)
                 
-                # 必须有经纬度
                 if 'latitude' in df.columns and 'longitude' in df.columns:
+                    # 数据清洗
                     df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
                     df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
                     df = df.dropna(subset=['latitude', 'longitude'])
                     
-                    # 时间转换
                     if 'sighting_datetime' in df.columns:
                         df['sighting_datetime'] = pd.to_datetime(df['sighting_datetime'], errors='coerce')
                     else:
                         df['sighting_datetime'] = pd.NaT
 
-                    # 描述字段构建
+                    # 描述构建
                     def make_description(row):
                         parts = []
-                        # 不同年份字段名可能不同，尝试所有可能性
-                        possible_cols = ['目撃市町村', '場所', '住所', '詳細', '状況', 'Municipality', 'Place']
+                        possible_cols = ['目撃市町村', '場所', '住所', '詳細', '状況']
                         for col in possible_cols:
                             val = str(row.get(col, ''))
                             if val and val != 'nan':
@@ -72,7 +69,6 @@ def load_yamanashi_data():
                     
                     df['sighting_condition'] = df.apply(make_description, axis=1)
                     
-                    # 统一列结构
                     clean_df = df[['latitude', 'longitude', 'sighting_datetime', 'sighting_condition']]
                     all_frames.append(clean_df)
                     
@@ -104,11 +100,13 @@ with col2:
     st.subheader("⚙️ 检测设置")
     buffer_radius_m = st.slider("预警距离 (米)", 100, 5000, 500, 100)
     
-    # 显示数据统计
     if not all_bears.empty:
-        min_date = all_bears['sighting_datetime'].min().strftime('%Y-%m')
-        max_date = all_bears['sighting_datetime'].max().strftime('%Y-%m')
-        st.info(f"📚 数据库覆盖: {min_date} 至 {max_date}\n总记录数: {len(all_bears)}")
+        # 显示数据覆盖范围
+        valid_dates = all_bears['sighting_datetime'].dropna()
+        if not valid_dates.empty:
+            min_d = valid_dates.min().strftime('%Y-%m')
+            max_d = valid_dates.max().strftime('%Y-%m')
+            st.info(f"📚 数据覆盖: {min_d} ~ {max_d}\n总记录: {len(all_bears)}")
     
     st.divider()
 
@@ -135,20 +133,20 @@ if uploaded_file:
         points_count = len(points)
         
         if points_count > 0:
-            # 地图中心
+            # 初始化地图
             start_lat, start_lon = points[0]
             m = folium.Map(location=[start_lat, start_lon], zoom_start=12, tiles="OpenStreetMap")
             
-            # 画路线 (蓝线)
+            # 1. 画路线
             folium.PolyLine(points, color="blue", weight=5, opacity=0.7).add_to(m)
             
-            # 缓冲区计算
-            line_points = [(p[1], p[0]) for p in points]
+            # 2. 计算缓冲区
+            line_points = [(p[1], p[0]) for p in points] # Shapely (Lon, Lat)
             route_line = LineString(line_points)
             deg_buffer = buffer_radius_m / 90000.0
             route_buffer = route_line.buffer(deg_buffer)
             
-            # 粗筛
+            # 3. 粗筛
             min_x, min_y, max_x, max_y = route_buffer.bounds
             candidates = all_bears[
                 (all_bears['longitude'] >= min_x - 0.05) & 
@@ -157,7 +155,7 @@ if uploaded_file:
                 (all_bears['latitude'] <= max_y + 0.05)
             ]
             
-            # 精筛与绘图
+            # 4. 精筛与绘图
             for idx, row in candidates.iterrows():
                 b_lat = float(row['latitude'])
                 b_lon = float(row['longitude'])
@@ -166,7 +164,6 @@ if uploaded_file:
                 if route_buffer.contains(bear_pt):
                     danger_list.append(row)
                     
-                    # 红点高亮
                     folium.Marker(
                         location=[b_lat, b_lon],
                         popup=f"⚠️ {str(row['sighting_datetime'])[:10]}",
@@ -180,4 +177,35 @@ if uploaded_file:
             st.warning("GPX 解析成功但无坐标点。")
             
     except Exception as e:
-        st.error(f"处理报错: {
+        # 这里就是你之前报错的地方，现在修复了
+        st.error(f"处理报错: {e}")
+
+# ==========================================
+# 4. 渲染输出
+# ==========================================
+with col1:
+    if map_html:
+        components.html(map_html, height=600)
+    else:
+        m_empty = folium.Map(location=[35.6, 138.5], zoom_start=10)
+        components.html(m_empty._repr_html_(), height=600)
+
+with col2:
+    if uploaded_file:
+        if danger_list:
+            st.markdown("#### 📊 检测报告")
+            st.error(f"🔴 最终确认: {len(danger_list)} 个危险点 (范围: {buffer_radius_m}米)")
+            
+            res_df = pd.DataFrame(danger_list).sort_values('sighting_datetime', ascending=False)
+            
+            st.dataframe(
+                res_df[['sighting_datetime', 'sighting_condition']],
+                hide_index=True,
+                height=500
+            )
+        else:
+            if points_count > 0:
+                st.success(f"🟢 安全 (范围: {buffer_radius_m}米)")
+                st.caption("路线周边未发现记录。")
+    else:
+        st.info("👈 请先上传 GPX")
