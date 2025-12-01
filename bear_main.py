@@ -10,7 +10,8 @@ import datetime
 # ==========================================
 # 0. 页面配置
 # ==========================================
-st.set_page_config(page_title="熊出没地图 (极简高亮版)", layout="wide", page_icon="🐻")
+st.set_page_config(page_title="熊出没地图 (基础稳健版)", layout="wide", page_icon="🐻")
+st.title("🐻 熊出没安全地图")
 
 # ==========================================
 # 1. 数据抽取
@@ -31,9 +32,11 @@ def load_yamanashi_data():
                 for col in ['lat', 'Lat', 'LAT', '纬度']:
                     if col in df.columns: df = df.rename(columns={col: 'latitude'}); break
 
+            # 强转 float，删除空值
             df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
             df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
             df = df.dropna(subset=['latitude', 'longitude'])
+            
             df['sighting_datetime'] = pd.to_datetime(df['sighting_datetime'], errors='coerce')
 
             def make_description(row):
@@ -45,129 +48,133 @@ def load_yamanashi_data():
         return pd.DataFrame()
     return pd.DataFrame()
 
-# ==========================================
-# 2. 主逻辑
-# ==========================================
-st.title("🐻 熊出没安全地图 (极简高亮)")
-
 all_bears = load_yamanashi_data()
 if all_bears.empty:
     st.error("❌ 数据库加载失败")
     st.stop()
 
+# ==========================================
+# 2. 界面布局
+# ==========================================
 with st.sidebar:
     st.header("⚙️ 设置")
     buffer_radius_m = st.slider("预警距离 (米)", 100, 5000, 500, 100)
 
-col1, col2 = st.columns([3, 1])
-with col1:
-    uploaded_file = st.file_uploader("📂 上传 GPX 文件", type=['gpx'])
-
-# 这里的中心点稍后会根据路线自动调整，先给个默认值
-m = folium.Map(location=[35.6, 138.5], zoom_start=10, tiles="OpenStreetMap")
+uploaded_file = st.file_uploader("📂 上传 GPX 文件", type=['gpx'])
 
 # ==========================================
-# 3. GPX 处理与分层绘图
+# 3. 处理逻辑 (含文本诊断)
 # ==========================================
-detected_danger = []
+map_html = ""
+danger_list = []
+debug_text = ""
 
-if uploaded_file is not None:
+if uploaded_file:
     try:
+        # --- A. 解析 GPX ---
         gpx = gpxpy.parse(uploaded_file)
-        
-        # --- 步骤 1: 提取坐标 ---
-        raw_points = []
+        points = []
         for track in gpx.tracks:
             for segment in track.segments:
                 for point in segment.points:
-                    raw_points.append((point.latitude, point.longitude))
-        if not raw_points:
+                    points.append((point.latitude, point.longitude))
+        
+        # 如果 tracks 为空，尝试 routes
+        if not points:
             for route in gpx.routes:
                 for point in route.points:
-                    raw_points.append((point.latitude, point.longitude))
-
-        if len(raw_points) > 1:
-            # 抽稀 (保留 1/10 的点用于画图和计算)
-            step = max(1, len(raw_points) // 500)
-            folium_points = raw_points[::step]
-            shapely_points = [(p[1], p[0]) for p in folium_points] # Lon, Lat
-
-            # --- 步骤 2: 计算缓冲区 ---
+                    points.append((point.latitude, point.longitude))
+        
+        # 文本诊断 1
+        st.info(f"📍 GPX 解析状态: 成功读取到 {len(points)} 个坐标点。")
+        
+        if len(points) > 0:
+            # --- B. 准备地图 ---
+            # 既然有点，就强制地图中心定在起跑点
+            start_lat, start_lon = points[0]
+            m = folium.Map(location=[start_lat, start_lon], zoom_start=12, tiles="OpenStreetMap")
+            
+            # --- C. 画路线 (不做任何抽稀，原样画) ---
+            folium.PolyLine(points, color="blue", weight=5, opacity=0.7).add_to(m)
+            
+            # --- D. 计算危险点 ---
+            # 准备 Shapely 线段用于计算
+            # 注意：Shapely 用 (Lon, Lat)
+            line_points = [(p[1], p[0]) for p in points]
+            route_line = LineString(line_points)
+            
+            # 计算简单的缓冲区
             deg_buffer = buffer_radius_m / 90000.0
-            route_line = LineString(shapely_points)
-            raw_buffer = route_line.buffer(deg_buffer)
+            route_buffer = route_line.buffer(deg_buffer)
             
-            # 缩放地图视野
-            m.fit_bounds(route_line.bounds)
-
-            # --- 步骤 3: 绘制底层 (橙色范围) ---
-            # 放在最前面画，保证在最底下
-            simplified_buffer = raw_buffer.simplify(tolerance=0.0005)
-            folium.GeoJson(
-                simplified_buffer,
-                style_function=lambda x: {'fillColor': '#FFA500', 'color': '#FFA500', 'weight': 0, 'fillOpacity': 0.2}
-            ).add_to(m)
-            
-            # --- 步骤 4: 绘制中层 (蓝色路线) ---
-            folium.PolyLine(folium_points, color="#3388ff", weight=5, opacity=0.8).add_to(m)
-
-            # --- 步骤 5: 计算危险点 ---
-            min_x, min_y, max_x, max_y = raw_buffer.bounds
+            # 暴力循环检查所有熊
+            # 先用矩形框快速过滤一下，提升速度
+            min_x, min_y, max_x, max_y = route_buffer.bounds
             candidates = all_bears[
                 (all_bears['longitude'] >= min_x - 0.05) & 
                 (all_bears['longitude'] <= max_x + 0.05) &
                 (all_bears['latitude'] >= min_y - 0.05) & 
                 (all_bears['latitude'] <= max_y + 0.05)
             ]
-
+            
+            st.info(f"🔎 粗筛检测: 路线附近发现 {len(candidates)} 条记录，正在进行精确判定...")
+            
             for idx, row in candidates.iterrows():
-                b_lon = float(row['longitude'])
                 b_lat = float(row['latitude'])
+                b_lon = float(row['longitude'])
+                bear_pt = Point(b_lon, b_lat)
                 
-                # 判定
-                if raw_buffer.contains(Point(b_lon, b_lat)):
-                    detected_danger.append(row)
+                if route_buffer.contains(bear_pt):
+                    danger_list.append(row)
                     
-                    # --- 步骤 6: 绘制顶层 (红色高亮圆点) ---
-                    # 使用 CircleMarker (radius 是像素单位，不是米)
-                    # 无论地图怎么缩放，这都是一个醒目的红点
-                    folium.CircleMarker(
+                    # --- E. 画红点 (使用最原始的 Marker) ---
+                    # 不用 CircleMarker，不用 SVG，就用最普通的红色图钉
+                    folium.Marker(
                         location=[b_lat, b_lon],
-                        radius=8,          # 8像素半径
-                        color="red",       # 边框
-                        weight=2,
-                        fill=True,
-                        fill_color="red",  # 填充
-                        fill_opacity=1.0,  # 不透明
-                        popup="⚠️ DANGER", 
-                        z_index_offset=9999 # 强制最前
+                        popup="DANGER",
+                        icon=folium.Icon(color='red', icon='info-sign')
                     ).add_to(m)
-
+            
+            # 调整缩放
+            m.fit_bounds(route_line.bounds)
+            
+            # 生成 HTML
+            map_html = m._repr_html_()
+            
+        else:
+            st.warning("GPX 文件里没有找到路径点 (points is empty)。请检查文件内容。")
+            
     except Exception as e:
-        st.error(f"处理失败: {e}")
+        st.error(f"处理过程报错: {e}")
 
 # ==========================================
-# 4. 渲染地图
+# 4. 渲染输出
 # ==========================================
+col1, col2 = st.columns([3, 1])
+
 with col1:
-    map_html = m._repr_html_()
-    components.html(map_html, height=600)
+    if map_html:
+        # 静态渲染
+        components.html(map_html, height=600)
+    else:
+        # 如果没有 map_html，显示一个空地图占位
+        m_empty = folium.Map(location=[35.6, 138.5], zoom_start=10)
+        components.html(m_empty._repr_html_(), height=600)
 
-# --- 结果面板 ---
 with col2:
     if uploaded_file:
-        st.subheader("📊 危险列表")
-        if detected_danger:
-            st.error(f"🔴 发现 {len(detected_danger)} 个危险点")
+        if danger_list:
+            st.error(f"🔴 最终确认: {len(danger_list)} 个危险点")
+            res_df = pd.DataFrame(danger_list).sort_values('sighting_datetime', ascending=False)
             
-            res_df = pd.DataFrame(detected_danger).sort_values('sighting_datetime', ascending=False)
-            for idx, row in res_df.iterrows():
-                d_str = row['sighting_datetime'].strftime('%Y-%m-%d') if pd.notnull(row['sighting_datetime']) else "未知"
-                with st.expander(f"⚠️ {d_str}", expanded=True):
-                    st.write(f"**详情:** {row['sighting_condition']}")
-                    # 显示坐标
-                    st.caption(f"{row['latitude']:.5f}, {row['longitude']:.5f}")
+            # 简单列表
+            st.dataframe(
+                res_df[['sighting_datetime', 'sighting_condition']],
+                hide_index=True,
+                height=500
+            )
         else:
-            st.success("🟢 路线周边安全")
+            if len(points) > 0:
+                st.success("🟢 安全: 路线 500米 内无记录")
     else:
-        st.info("👈 请上传 GPX")
+        st.info("👈 等待上传 GPX")
