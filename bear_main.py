@@ -10,7 +10,7 @@ import datetime
 # ==========================================
 # 0. 页面配置
 # ==========================================
-st.set_page_config(page_title="熊出没地图 (全量数据版)", layout="wide", page_icon="🐻")
+st.set_page_config(page_title="熊出没地图 (时间筛选版)", layout="wide", page_icon="🐻")
 st.title("🐻 熊出没安全地图 (2022-2025 全量数据)")
 
 # ==========================================
@@ -22,9 +22,9 @@ def load_yamanashi_data():
     
     # 包含最新和历史数据的 Resource ID 列表
     resource_ids = [
-        "b4eb262f-07e0-4417-b24f-6b15844b4ac1", # 2024-2025 (最新)
-        "62796404-c80f-47d6-ae88-222f844ee958", # 2023 (历史)
-        "89d2478e-e29e-46e3-9ad3-19bf44822d4d"  # 2022 (历史)
+        "b4eb262f-07e0-4417-b24f-6b15844b4ac1", # 2024-2025
+        "62796404-c80f-47d6-ae88-222f844ee958", # 2023
+        "89d2478e-e29e-46e3-9ad3-19bf44822d4d"  # 2022
     ]
     
     all_frames = []
@@ -73,7 +73,6 @@ def load_yamanashi_data():
                     all_frames.append(clean_df)
                     
         except Exception as e:
-            print(f"ID {rid} 加载失败: {e}")
             continue
 
     if all_frames:
@@ -82,31 +81,58 @@ def load_yamanashi_data():
     else:
         return pd.DataFrame()
 
-# 加载数据
+# 加载原始全量数据
 all_bears = load_yamanashi_data()
 if all_bears.empty:
     st.error("❌ 数据库加载失败")
     st.stop()
 
 # ==========================================
-# 2. 界面布局
+# 2. 界面布局与筛选逻辑
 # ==========================================
 col1, col2 = st.columns([3, 1])
 
 with col1:
-    uploaded_file = st.file_uploader("📂 上传 GPX 路线文件", type=['gpx'])
+    uploaded_file = st.file_uploader("📂 第一步: 上传 GPX 路线文件", type=['gpx'])
 
 with col2:
     st.subheader("⚙️ 检测设置")
-    buffer_radius_m = st.slider("预警距离 (米)", 100, 5000, 500, 100)
     
-    if not all_bears.empty:
-        # 显示数据覆盖范围
-        valid_dates = all_bears['sighting_datetime'].dropna()
-        if not valid_dates.empty:
-            min_d = valid_dates.min().strftime('%Y-%m')
-            max_d = valid_dates.max().strftime('%Y-%m')
-            st.info(f"📚 数据覆盖: {min_d} ~ {max_d}\n总记录: {len(all_bears)}")
+    # --- 新增功能：时间范围筛选 ---
+    # 获取数据中的最早和最晚时间
+    valid_dates = all_bears['sighting_datetime'].dropna()
+    if not valid_dates.empty:
+        min_date = valid_dates.min().date()
+        max_date = valid_dates.max().date()
+        
+        # 默认选中全量时间，让用户自己缩小
+        date_range = st.date_input(
+            "📅 时间范围筛选",
+            value=(min_date, max_date),
+            min_value=min_date,
+            max_value=max_date,
+            help="只检测该时间段内的熊出没记录"
+        )
+        
+        # 处理筛选逻辑
+        if len(date_range) == 2:
+            start_d, end_d = date_range
+            # 生成筛选后的数据表
+            bears_to_check = all_bears[
+                (all_bears['sighting_datetime'].dt.date >= start_d) & 
+                (all_bears['sighting_datetime'].dt.date <= end_d)
+            ]
+        else:
+            bears_to_check = all_bears
+    else:
+        st.warning("数据中缺少时间信息，无法筛选。")
+        bears_to_check = all_bears
+
+    # --- 预警距离设置 ---
+    buffer_radius_m = st.slider("📏 预警距离 (米)", 100, 5000, 500, 100)
+    
+    # 显示当前生效的数据量
+    st.caption(f"🔍 当前生效记录: {len(bears_to_check)} 条 (总计: {len(all_bears)})")
     
     st.divider()
 
@@ -140,19 +166,19 @@ if uploaded_file:
             # 1. 画路线
             folium.PolyLine(points, color="blue", weight=5, opacity=0.7).add_to(m)
             
-            # 2. 计算缓冲区
+            # 2. 缓冲区计算
             line_points = [(p[1], p[0]) for p in points] # Shapely (Lon, Lat)
             route_line = LineString(line_points)
             deg_buffer = buffer_radius_m / 90000.0
             route_buffer = route_line.buffer(deg_buffer)
             
-            # 3. 粗筛
+            # 3. 粗筛 (使用 bears_to_check 即筛选后的数据)
             min_x, min_y, max_x, max_y = route_buffer.bounds
-            candidates = all_bears[
-                (all_bears['longitude'] >= min_x - 0.05) & 
-                (all_bears['longitude'] <= max_x + 0.05) &
-                (all_bears['latitude'] >= min_y - 0.05) & 
-                (all_bears['latitude'] <= max_y + 0.05)
+            candidates = bears_to_check[
+                (bears_to_check['longitude'] >= min_x - 0.05) & 
+                (bears_to_check['longitude'] <= max_x + 0.05) &
+                (bears_to_check['latitude'] >= min_y - 0.05) & 
+                (bears_to_check['latitude'] <= max_y + 0.05)
             ]
             
             # 4. 精筛与绘图
@@ -177,7 +203,6 @@ if uploaded_file:
             st.warning("GPX 解析成功但无坐标点。")
             
     except Exception as e:
-        # 这里就是你之前报错的地方，现在修复了
         st.error(f"处理报错: {e}")
 
 # ==========================================
@@ -192,20 +217,21 @@ with col1:
 
 with col2:
     if uploaded_file:
-        if danger_list:
+        if points_count > 0:
             st.markdown("#### 📊 检测报告")
-            st.error(f"🔴 最终确认: {len(danger_list)} 个危险点 (范围: {buffer_radius_m}米)")
             
-            res_df = pd.DataFrame(danger_list).sort_values('sighting_datetime', ascending=False)
-            
-            st.dataframe(
-                res_df[['sighting_datetime', 'sighting_condition']],
-                hide_index=True,
-                height=500
-            )
-        else:
-            if points_count > 0:
+            if danger_list:
+                st.error(f"🔴 发现 {len(danger_list)} 个危险点 (范围: {buffer_radius_m}米)")
+                
+                res_df = pd.DataFrame(danger_list).sort_values('sighting_datetime', ascending=False)
+                
+                st.dataframe(
+                    res_df[['sighting_datetime', 'sighting_condition']],
+                    hide_index=True,
+                    height=500
+                )
+            else:
                 st.success(f"🟢 安全 (范围: {buffer_radius_m}米)")
-                st.caption("路线周边未发现记录。")
+                st.caption("在选定的时间范围内，路线周边未发现记录。")
     else:
         st.info("👈 请先上传 GPX")
