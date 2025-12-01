@@ -6,115 +6,59 @@ import gpxpy
 from shapely.geometry import Point, LineString
 from streamlit_folium import st_folium
 import folium
-from folium.plugins import MarkerCluster, FastMarkerCluster
+from folium.plugins import MarkerCluster
 import datetime
 
 # ==========================================
 # 0. 页面基础配置
 # ==========================================
 st.set_page_config(
-    page_title="日本熊出没安全地图 (秋田+山梨)", 
+    page_title="山梨县熊出没安全地图", 
     layout="wide", 
     page_icon="🐻"
 )
 
 # ==========================================
-# 1. 数据抽取与清洗层 (ETL)
+# 1. 数据抽取层 (仅山梨县 API)
 # ==========================================
 
-# --- A. 加载秋田县数据 (本地 bears.json) ---
-@st.cache_data
-def load_akita_data(filepath="bears.json"):
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            # 尝试解析 JSON
-            try:
-                raw_data = json.load(f)
-            except json.JSONDecodeError:
-                st.error("❌ `bears.json` 文件格式错误。请确保在 Charles 中使用的是 'Save Response Body'，而不是保存整个 Response。")
-                return pd.DataFrame()
-        
-        # 检查数据结构 (适配 kumadas.net 的结构)
-        if 'result' in raw_data:
-            df = pd.DataFrame(raw_data['result'])
-        else:
-            st.warning("⚠️ `bears.json` 中找不到 'result' 字段，请检查数据源。")
-            return pd.DataFrame()
-            
-        # 字段标准化 (目标: latitude, longitude, sighting_datetime, sighting_condition)
-        # 假设 kumadas.net 返回的已经是标准字段，如果不是，需要在这里 rename
-        # 这里做一点容错处理
-        if 'latitude' not in df.columns and 'lat' in df.columns:
-            df = df.rename(columns={'lat': 'latitude', 'lon': 'longitude', 'body': 'sighting_condition', 'date': 'sighting_datetime'})
-            
-        # 确保关键列存在
-        required_cols = ['latitude', 'longitude']
-        if not all(col in df.columns for col in required_cols):
-            st.warning("⚠️ 秋田数据缺失经纬度字段。")
-            return pd.DataFrame()
-
-        # 数据类型清洗
-        df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
-        df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
-        df['sighting_datetime'] = pd.to_datetime(df['sighting_datetime'], errors='coerce')
-        
-        # 补充缺失值
-        if 'sighting_condition' not in df.columns:
-            df['sighting_condition'] = "无详细描述"
-        else:
-            df['sighting_condition'] = df['sighting_condition'].fillna("无详细描述")
-
-        # 添加来源标签
-        df['source'] = '秋田县 (本地)'
-        
-        return df[['latitude', 'longitude', 'sighting_datetime', 'sighting_condition', 'source']].dropna(subset=['latitude', 'longitude'])
-        
-    except FileNotFoundError:
-        st.error("❌ 找不到 `bears.json` 文件。请将 Charles 抓到的数据保存到项目根目录。")
-        return pd.DataFrame()
-    except Exception as e:
-        st.error(f"❌ 秋田数据加载未知错误: {e}")
-        return pd.DataFrame()
-
-# --- B. 加载山梨县数据 (远程 CKAN API) ---
 @st.cache_data
 def load_yamanashi_data():
+    # 山梨县 CKAN API 地址
     url = "https://catalog.dataplatform-yamanashi.jp/api/action/datastore_search"
     params = {
         "resource_id": "b4eb262f-07e0-4417-b24f-6b15844b4ac1",
-        "limit": 5000 
+        "limit": 10000  # 获取 10000 条，确保覆盖全量
     }
     
     try:
-        response = requests.get(url, params=params, timeout=15) # 设置超时防止卡死
+        response = requests.get(url, params=params, timeout=15)
         data = response.json()
         
         if 'result' in data and 'records' in data['result']:
             df = pd.DataFrame(data['result']['records'])
             
-            # 1. 字段名映射 (基于你提供的样本)
+            # 1. 字段名映射
             rename_map = {
-                '緯度': 'latitude',
-                '経度': 'longitude',
-                '年月日': 'sighting_datetime' # 样本显示是这个字段
+                '緯度': 'latitude', 
+                '経度': 'longitude', 
+                '年月日': 'sighting_datetime'
             }
             df = df.rename(columns=rename_map)
             
-            # 如果映射后没有找到关键列，说明 API 字段名变了，打印出来调试
+            # 容错：如果 API 字段名变了，尝试其他可能
             if 'latitude' not in df.columns:
-                # 尝试查找其他可能的列名
-                possible_lats = ['lat', 'Lat', 'LAT', '纬度']
-                for col in possible_lats:
+                for col in ['lat', 'Lat', 'LAT', '纬度']:
                     if col in df.columns:
                         df = df.rename(columns={col: 'latitude'})
                         break
-            
+
             # 2. 类型转换
             df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
             df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
             df['sighting_datetime'] = pd.to_datetime(df['sighting_datetime'], errors='coerce')
             
-            # 3. 智能构建描述字段 (拼接多个字段)
+            # 3. 智能拼接描述字段
             def make_description(row):
                 muni = str(row.get('目撃市町村', ''))
                 place = str(row.get('場所', ''))
@@ -128,9 +72,7 @@ def load_yamanashi_data():
                 if age and age != 'nan': details.append(age)
                 if count and count != 'nan': details.append(f"{count}頭")
                 
-                if details:
-                    desc += f" ({', '.join(details)})"
-                
+                if details: desc += f" ({', '.join(details)})"
                 return desc if desc else "API数据无描述"
 
             df['sighting_condition'] = df.apply(make_description, axis=1)
@@ -143,54 +85,54 @@ def load_yamanashi_data():
         return pd.DataFrame()
         
     except Exception as e:
-        st.warning(f"⚠️ 山梨县 API 连接失败 (可能是网络原因): {e}")
+        st.error(f"无法连接山梨县数据 API: {e}")
         return pd.DataFrame()
 
 # ==========================================
-# 2. 主逻辑控制器
+# 2. 主程序逻辑
 # ==========================================
 
-st.title("🐻 日本熊出没安全地图")
-st.markdown("融合 **秋田县 (本地库)** 与 **山梨县 (实时API)** 数据，提供全方位的徒步安全检测。")
+st.title("🐻 山梨县熊出没安全地图")
 
-# --- 加载数据 ---
-with st.spinner('正在融合多源数据...'):
-    df_akita = load_akita_data()
-    df_yamanashi = load_yamanashi_data()
-    
-    # 合并
-    all_bears = pd.concat([df_akita, df_yamanashi], ignore_index=True)
+# 加载数据
+with st.spinner('正在连接山梨县政府数据库...'):
+    all_bears = load_yamanashi_data()
 
-# --- 全局检查 ---
 if all_bears.empty:
-    st.error("❌ 所有数据源均加载失败。请检查：1. bears.json 是否存在且格式正确；2. 网络是否能访问山梨县 API。")
+    st.error("❌ 数据加载失败。请检查网络连接（是否需要关闭 VPN 或代理）。")
     st.stop()
-else:
-    st.success(f"✅ 成功加载 {len(all_bears)} 条记录 (秋田: {len(df_akita)}, 山梨: {len(df_yamanashi)})")
 
 # ==========================================
-# 3. 侧边栏：时间过滤器
+# 3. 侧边栏设置
 # ==========================================
 with st.sidebar:
-    st.header("⏳ 筛选设置")
+    st.header("⚙️ 参数设置")
     
-    # 过滤掉无效时间
+    # 预警距离滑块
+    st.subheader("📏 安全预警范围")
+    buffer_radius_m = st.slider(
+        "路线两侧检测距离 (米)",
+        min_value=100,
+        max_value=3000,
+        value=500,
+        step=100,
+        help="系统将检测路线周围这个距离内的熊出没记录。"
+    )
+    
+    st.divider()
+    
+    # 时间筛选
+    st.subheader("⏳ 时间筛选")
     valid_dates = all_bears['sighting_datetime'].dropna()
-    
     if not valid_dates.empty:
         min_date = valid_dates.min().date()
         max_date = valid_dates.max().date()
         
-        # 默认显示最近 1 年
+        # 默认最近 1 年
         default_start = max_date - datetime.timedelta(days=365)
         if default_start < min_date: default_start = min_date
 
-        date_range = st.date_input(
-            "选择目击时间范围",
-            value=(default_start, max_date),
-            min_value=min_date,
-            max_value=max_date
-        )
+        date_range = st.date_input("选择日期范围", value=(default_start, max_date), min_value=min_date, max_value=max_date)
         
         if len(date_range) == 2:
             start_d, end_d = date_range
@@ -201,32 +143,28 @@ with st.sidebar:
         else:
             filtered_df = all_bears.copy()
     else:
-        st.warning("数据中缺少时间字段，无法筛选。")
         filtered_df = all_bears.copy()
 
-    st.divider()
-    st.caption("Developed with Streamlit")
+    st.write(f"📊 当前筛选记录数: {len(filtered_df)}")
 
 # ==========================================
-# 4. 地图可视化核心
+# 4. 地图核心逻辑
 # ==========================================
 
-# 页面主要布局
 col1, col2 = st.columns([3, 1])
-
 with col1:
-    uploaded_file = st.file_uploader("📂 上传 GPX 路线文件 (开启精准检测)", type=['gpx'])
+    uploaded_file = st.file_uploader("📂 上传 GPX 路线文件", type=['gpx'])
 
-# 确定地图默认中心 (优先显示筛选后的数据中心，否则显示日本中心)
+# 确定地图中心
 if not filtered_df.empty:
     center_lat = filtered_df['latitude'].mean()
     center_lon = filtered_df['longitude'].mean()
 else:
-    center_lat, center_lon = 36.2048, 138.2529
+    center_lat, center_lon = 35.66, 138.56 # 山梨县大致中心
 
-m = folium.Map(location=[center_lat, center_lon], zoom_start=7, tiles="OpenStreetMap")
+m = folium.Map(location=[center_lat, center_lon], zoom_start=9, tiles="OpenStreetMap")
 
-# --- 场景 A: 路线检测模式 (用户上传了 GPX) ---
+# --- 场景 A: 路线检测模式 ---
 if uploaded_file is not None:
     try:
         gpx = gpxpy.parse(uploaded_file)
@@ -237,38 +175,49 @@ if uploaded_file is not None:
                     points.append((point.latitude, point.longitude))
         
         if points:
-            # 1. 绘制路线
-            folium.PolyLine(points, color="blue", weight=4, opacity=0.7, tooltip="徒步路线").add_to(m)
+            # 1. 计算缓冲区 (简单估算: 1度 ≈ 111km)
+            buffer_deg = buffer_radius_m / 111111 
             
-            # 2. 空间计算 (Buffer)
+            # 2. 生成几何对象
             route_line = LineString(points)
-            buffer_dist = 0.005 # 约 500m
-            route_buffer = route_line.buffer(buffer_dist)
+            route_buffer = route_line.buffer(buffer_deg)
+            
+            # 3. 画出“预警走廊” (浅橙色)
+            folium.GeoJson(
+                route_buffer,
+                style_function=lambda x: {
+                    'fillColor': '#FFA500', 'color': '#FFA500', 'weight': 1, 'fillOpacity': 0.2
+                },
+                tooltip=f"预警范围 ({buffer_radius_m}米)"
+            ).add_to(m)
+            
+            # 4. 画出路线 (深蓝色)
+            folium.PolyLine(
+                points, color="blue", weight=4, opacity=0.8, tooltip="徒步路线"
+            ).add_to(m)
+            
+            # 5. 空间碰撞检测
             min_lon, min_lat, max_lon, max_lat = route_buffer.bounds
             
-            # 3. 粗筛 (极大提升性能)
+            # 粗筛
             candidates = filtered_df[
                 (filtered_df['latitude'] >= min_lat) & (filtered_df['latitude'] <= max_lat) &
                 (filtered_df['longitude'] >= min_lon) & (filtered_df['longitude'] <= max_lon)
             ]
             
-            # 4. 精确检测
+            # 精筛
             dangerous_bears = []
             for idx, row in candidates.iterrows():
                 if route_buffer.contains(Point(row['latitude'], row['longitude'])):
                     dangerous_bears.append(row)
             
-            # 5. 渲染危险点
+            # 6. 标记危险点
             for bear in dangerous_bears:
-                # 颜色区分：秋田(红), 山梨(橙)
-                color = "red" if "秋田" in bear['source'] else "orange"
-                
                 date_str = bear['sighting_datetime'].strftime('%Y-%m-%d %H:%M') if pd.notnull(bear['sighting_datetime']) else "未知时间"
                 
                 popup_html = f"""
                 <div style="font-family:sans-serif; width:200px;">
-                    <b>{bear['source']}</b><br>
-                    <span style="color:red;">⚠️ {date_str}</span><br>
+                    <span style="color:red; font-weight:bold;">⚠️ {date_str}</span><br>
                     <hr style="margin:5px 0;">
                     {bear['sighting_condition']}
                 </div>
@@ -276,50 +225,53 @@ if uploaded_file is not None:
                 folium.Marker(
                     [bear['latitude'], bear['longitude']],
                     popup=folium.Popup(popup_html, max_width=250),
-                    icon=folium.Icon(color=color, icon="paw", prefix='fa')
+                    icon=folium.Icon(color="red", icon="paw", prefix='fa')
                 ).add_to(m)
-                
+            
             m.fit_bounds(route_line.bounds)
             
-            # 结果提示
-            if dangerous_bears:
-                st.error(f"⚠️ 警告：在路线 500米 范围内发现 {len(dangerous_bears)} 条熊出没记录！")
-                with st.expander("查看详细列表", expanded=True):
-                    st.dataframe(pd.DataFrame(dangerous_bears)[['sighting_datetime', 'source', 'sighting_condition']])
-            else:
-                st.success("✅ 该时间段内，路线周边安全（无记录）。")
+            # --- 结果面板 ---
+            with col2:
+                st.subheader("🔍 检测报告")
+                st.info(f"检测半径: **{buffer_radius_m} 米**")
+                
+                if dangerous_bears:
+                    st.error(f"🔴 发现 **{len(dangerous_bears)}** 处风险！")
+                    # 按时间倒序展示
+                    res_df = pd.DataFrame(dangerous_bears).sort_values('sighting_datetime', ascending=False)
+                    for idx, row in res_df.iterrows():
+                        date_display = row['sighting_datetime'].strftime('%m-%d')
+                        with st.expander(f"{date_display} - {row['sighting_condition'][:8]}...", expanded=False):
+                            st.write(f"**时间:** {row['sighting_datetime']}")
+                            st.write(f"**详情:** {row['sighting_condition']}")
+                else:
+                    st.success("🟢 路线周边安全")
+                    st.caption("未发现历史记录。")
+                    
         else:
-            st.warning("GPX 文件中未解析到路径点。")
-            
+            st.warning("GPX 解析失败：未找到路径点。")
     except Exception as e:
-        st.error(f"GPX 解析失败: {e}")
+        st.error(f"GPX 处理出错: {e}")
 
-# --- 场景 B: 全景探索模式 (默认) ---
+# --- 场景 B: 全景模式 ---
 else:
     if not filtered_df.empty:
-        # 使用 MarkerCluster 处理大量数据
         marker_cluster = MarkerCluster(name="熊出没聚合点").add_to(m)
-        
-        # 限制显示数量防止浏览器崩溃 (如果超过 5000 条)
-        limit = 5000
-        if len(filtered_df) > limit:
-            st.info(f"💡 数据量较大，地图仅显示最近的 {limit} 条记录。请使用侧边栏筛选缩短时间范围。")
-            display_data = filtered_df.sort_values('sighting_datetime', ascending=False).head(limit)
-        else:
-            display_data = filtered_df
+        limit = 3000
+        display_data = filtered_df.sort_values('sighting_datetime', ascending=False).head(limit)
             
         for idx, row in display_data.iterrows():
-            color = "red" if "秋田" in row['source'] else "orange"
             date_str = row['sighting_datetime'].strftime('%Y-%m-%d') if pd.notnull(row['sighting_datetime']) else ""
-            
-            # 简化的 Popup
-            popup_content = f"<b>{date_str}</b><br>{row['sighting_condition']}"
-            
             folium.Marker(
                 location=[row['latitude'], row['longitude']],
-                popup=folium.Popup(popup_content, max_width=200),
-                icon=folium.Icon(color=color, icon="info-sign"),
+                popup=f"<b>{date_str}</b><br>{row['sighting_condition']}",
+                icon=folium.Icon(color="orange", icon="info-sign"),
             ).add_to(marker_cluster)
+            
+    with col2:
+        st.info("👈 上传 GPX 文件以开启路线检测。")
+        st.write(f"全图显示最近 {len(display_data) if 'display_data' in locals() else 0} 条记录")
 
 # 渲染地图
-st_folium(m, width="100%", height=600)
+with col1:
+    st_folium(m, width="100%", height=600)
