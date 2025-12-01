@@ -11,7 +11,7 @@ import datetime
 # ==========================================
 # 0. 页面配置
 # ==========================================
-st.set_page_config(page_title="熊出没地图 (终极版)", layout="wide", page_icon="🐻")
+st.set_page_config(page_title="熊出没地图 (绝对渲染版)", layout="wide", page_icon="🐻")
 
 # ==========================================
 # 1. 数据抽取
@@ -32,10 +32,13 @@ def load_yamanashi_data():
                 for col in ['lat', 'Lat', 'LAT', '纬度']:
                     if col in df.columns: df = df.rename(columns={col: 'latitude'}); break
 
+            # 强制转为 float，并删除空值
             df['latitude'] = pd.to_numeric(df['latitude'], errors='coerce')
             df['longitude'] = pd.to_numeric(df['longitude'], errors='coerce')
-            df['sighting_datetime'] = pd.to_datetime(df['sighting_datetime'], errors='coerce')
             df = df.dropna(subset=['latitude', 'longitude'])
+            
+            # 处理日期
+            df['sighting_datetime'] = pd.to_datetime(df['sighting_datetime'], errors='coerce')
 
             def make_description(row):
                 parts = [str(row.get(c, '')) for c in ['目撃市町村', '場所'] if str(row.get(c, '')) != 'nan']
@@ -64,11 +67,11 @@ col1, col2 = st.columns([3, 1])
 with col1:
     uploaded_file = st.file_uploader("📂 上传 GPX 文件", type=['gpx'])
 
-center_lat, center_lon = 35.6, 138.5
-m = folium.Map(location=[center_lat, center_lon], zoom_start=10, tiles="OpenStreetMap")
+# 临时初始化，稍后会根据 GPX 覆盖
+m = folium.Map(location=[35.6, 138.5], zoom_start=10, tiles="OpenStreetMap")
 
 # ==========================================
-# 3. GPX 处理
+# 3. GPX 处理与绘图
 # ==========================================
 detected_danger = []
 
@@ -87,24 +90,31 @@ if uploaded_file is not None:
                     raw_points.append((point.latitude, point.longitude))
 
         if len(raw_points) > 1:
-            # 1. 画蓝色路线
-            # 抽稀防止卡顿
+            # --- 1. 路线处理 ---
             step = max(1, len(raw_points) // 500)
             folium_points = raw_points[::step]
-            shapely_points = [(p[1], p[0]) for p in folium_points]
+            # 这里的转换非常关键：shapely 需要 (Lon, Lat)
+            shapely_points = [(float(p[1]), float(p[0])) for p in folium_points]
 
-            folium.PolyLine(folium_points, color="#3388ff", weight=5, opacity=0.8).add_to(m)
+            # 画蓝色路线
+            folium.PolyLine(folium_points, color="blue", weight=5, opacity=0.7).add_to(m)
             
-            # 2. 计算缓冲区 (仅用于数学计算，不画在地图上，防止崩溃)
+            # --- 2. 橙色缓冲区 (恢复显示) ---
             deg_buffer = buffer_radius_m / 90000.0
             route_line = LineString(shapely_points)
             raw_buffer = route_line.buffer(deg_buffer)
             
-            # 3. 调整地图视野
+            # 简化后绘制橙色区域
+            simplified_buffer = raw_buffer.simplify(tolerance=0.0005)
+            folium.GeoJson(
+                simplified_buffer,
+                style_function=lambda x: {'fillColor': '#FFA500', 'color': '#FFA500', 'weight': 1, 'fillOpacity': 0.2}
+            ).add_to(m)
+            
+            # 强制调整地图视野到路线位置
             m.fit_bounds(route_line.bounds)
 
-            # 4. 暴力扫描 + 绘制红点
-            # 先缩小范围提升速度
+            # --- 3. 检测危险 ---
             min_x, min_y, max_x, max_y = raw_buffer.bounds
             candidates = all_bears[
                 (all_bears['longitude'] >= min_x - 0.05) & 
@@ -114,79 +124,61 @@ if uploaded_file is not None:
             ]
 
             for idx, row in candidates.iterrows():
+                # 【关键修复】强制转换为 Python 原生 float
                 b_lon = float(row['longitude'])
                 b_lat = float(row['latitude'])
                 bear_pt = Point(b_lon, b_lat)
                 
-                # 判定是否在圈内
                 if raw_buffer.contains(bear_pt):
                     detected_danger.append(row)
                     
-                    # === 绘制逻辑 (只有这里画图) ===
-                    
-                    # 1. 计算连接线
+                    # --- 绘制危险点 (使用物理大圆圈) ---
+                    # 计算最近连接点
                     nearest = nearest_points(route_line, bear_pt)[0]
-                    line_coords = [[nearest.y, nearest.x], [b_lat, b_lon]]
                     
                     # 画红线
                     folium.PolyLine(
-                        line_coords,
-                        color="#FF0000", # 纯红 Hex
-                        weight=3,
-                        dash_array='5, 5',
-                        opacity=1.0
+                        [[nearest.y, nearest.x], [b_lat, b_lon]],
+                        color="red", weight=3, dash_array='5, 5', opacity=1
                     ).add_to(m)
                     
-                    # 画大红点 (CircleMarker 绝对稳)
-                    folium.CircleMarker(
+                    # 画大红圈 (folium.Circle)
+                    # radius=200 表示半径200米，这个圆在地图上会非常巨大，不可能看不见
+                    folium.Circle(
                         location=[b_lat, b_lon],
-                        radius=8,
-                        color="#FF0000",
+                        radius=200,          # 物理半径 200米
+                        color="red",
                         fill=True,
-                        fill_color="#FF0000",
-                        fill_opacity=1.0,
-                        stroke=True,
-                        weight=2,
-                        popup="DANGER", # 简单文本
-                        z_index_offset=1000
+                        fill_color="red",
+                        fill_opacity=0.8,
+                        popup="DANGER",
+                        tooltip="点击查看详情"
                     ).add_to(m)
 
     except Exception as e:
-        st.error(f"处理出错: {e}")
+        st.error(f"处理失败: {e}")
 
 # ==========================================
-# 4. 渲染地图
+# 4. 渲染
 # ==========================================
 with col1:
-    # 静态渲染
     map_html = m._repr_html_()
     components.html(map_html, height=600)
 
-# --- 结果面板 (保留你需要的列表) ---
 with col2:
     if uploaded_file:
-        st.subheader("📊 详细危险点列表")
-        
+        st.subheader("📊 危险列表")
         if detected_danger:
-            st.error(f"🔴 共发现 {len(detected_danger)} 处威胁")
+            st.error(f"🔴 发现 {len(detected_danger)} 个危险点")
             
-            # 整理数据
             res_df = pd.DataFrame(detected_danger).sort_values('sighting_datetime', ascending=False)
-            
-            # 循环展示详情卡片
             for idx, row in res_df.iterrows():
-                # 处理时间格式
-                if pd.notnull(row['sighting_datetime']):
-                    d_str = row['sighting_datetime'].strftime('%Y-%m-%d')
-                else:
-                    d_str = "时间未知"
-                
+                d_str = row['sighting_datetime'].strftime('%Y-%m-%d') if pd.notnull(row['sighting_datetime']) else "未知"
                 with st.expander(f"⚠️ {d_str}", expanded=True):
-                    st.write(f"**地点:** {row['sighting_condition']}")
-                    # 这里显示坐标方便核对
+                    st.write(f"**详情:** {row['sighting_condition']}")
+                    # 显示坐标，方便你在地图上找
                     st.caption(f"坐标: {row['latitude']:.4f}, {row['longitude']:.4f}")
         else:
             st.success("🟢 路线周边安全")
-            st.caption(f"检测范围: {buffer_radius_m} 米")
     else:
-        st.info("👈 请先上传 GPX 文件")
+        st.info("👈 请上传 GPX")
