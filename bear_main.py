@@ -3,7 +3,7 @@ import streamlit.components.v1 as components
 import pandas as pd
 import requests
 import gpxpy
-from shapely.geometry import Point, LineString
+from shapely.geometry import Point, LineString, box
 from shapely.ops import nearest_points
 import folium
 from folium.plugins import MarkerCluster
@@ -12,13 +12,14 @@ import datetime
 # ==========================================
 # 0. 页面配置
 # ==========================================
-st.set_page_config(page_title="熊出没安全地图 (高亮修复版)", layout="wide", page_icon="🐻")
+st.set_page_config(page_title="熊出没地图 (诊断版)", layout="wide", page_icon="🐻")
 
 # ==========================================
-# 1. 数据抽取
+# 1. 数据抽取 (山梨县)
 # ==========================================
 @st.cache_data
 def load_yamanashi_data():
+    # 这里只获取山梨县数据。如果你的GPX不在山梨，这里将没有任何匹配。
     url = "https://catalog.dataplatform-yamanashi.jp/api/action/datastore_search"
     params = {"resource_id": "b4eb262f-07e0-4417-b24f-6b15844b4ac1", "limit": 10000}
     try:
@@ -50,34 +51,33 @@ def load_yamanashi_data():
 # ==========================================
 # 2. 主逻辑
 # ==========================================
-st.title("🐻 熊出没安全地图")
+st.title("🐻 熊出没安全地图 (强制显示诊断版)")
+st.caption("🔴红色=危险(范围内) | ⚫灰色=附近数据(范围外) | 如果全是空白，说明该区域无数据")
 
 all_bears = load_yamanashi_data()
 if all_bears.empty:
-    st.error("❌ 数据库加载失败")
+    st.error("❌ 数据库加载失败，请检查网络。")
     st.stop()
 
 with st.sidebar:
     st.header("⚙️ 设置")
-    buffer_radius_m = st.slider("预警距离 (米)", 100, 3000, 500, 100)
-    st.caption("调整滑块可改变黄色警戒区域的大小")
+    buffer_radius_m = st.slider("预警距离 (米)", 100, 5000, 500, 100)
+    st.info(f"当前只检测【山梨县】数据。\n总记录数: {len(all_bears)}")
 
 col1, col2 = st.columns([3, 1])
 with col1:
     uploaded_file = st.file_uploader("📂 上传 GPX 文件", type=['gpx'])
 
-# 地图默认中心
+# 默认中心
 center_lat, center_lon = 35.6, 138.5
-if not all_bears.empty:
-    center_lat, center_lon = all_bears['latitude'].mean(), all_bears['longitude'].mean()
-
 m = folium.Map(location=[center_lat, center_lon], zoom_start=10, tiles="OpenStreetMap")
 
 # ==========================================
-# 3. GPX 处理与高亮绘图
+# 3. GPX 处理与诊断逻辑
 # ==========================================
 detected_danger = []
-has_gpx = False
+nearby_bears_count = 0
+debug_info = []
 
 if uploaded_file is not None:
     try:
@@ -94,23 +94,28 @@ if uploaded_file is not None:
                     raw_points.append((point.latitude, point.longitude))
 
         if len(raw_points) > 1:
-            has_gpx = True
+            # 1. GPX 基础信息
+            lat_list = [p[0] for p in raw_points]
+            lon_list = [p[1] for p in raw_points]
+            min_lat, max_lat = min(lat_list), max(lat_list)
+            min_lon, max_lon = min(lon_list), max(lon_list)
             
-            # --- 抽稀 (性能优化) ---
+            debug_info.append(f"📍 GPX 纬度范围: {min_lat:.4f} ~ {max_lat:.4f}")
+            debug_info.append(f"📍 GPX 经度范围: {min_lon:.4f} ~ {max_lon:.4f}")
+
+            # 2. 画路线
             step = max(1, len(raw_points) // 500)
             folium_points = raw_points[::step]
             shapely_points = [(p[1], p[0]) for p in folium_points] # (Lon, Lat)
 
-            # 1. 画路线 (蓝色)
             folium.PolyLine(folium_points, color="blue", weight=4, opacity=0.8).add_to(m)
             
-            # 2. 缓冲区
+            # 3. 生成缓冲区
             deg_buffer = buffer_radius_m / 90000.0
             route_line = LineString(shapely_points)
             raw_buffer = route_line.buffer(deg_buffer)
             simplified_buffer = raw_buffer.simplify(tolerance=0.0005)
 
-            # 3. 画警戒区域 (橙色)
             folium.GeoJson(
                 simplified_buffer,
                 style_function=lambda x: {'fillColor': 'orange', 'color': 'orange', 'weight': 1, 'fillOpacity': 0.15}
@@ -118,63 +123,62 @@ if uploaded_file is not None:
             
             m.fit_bounds(route_line.bounds)
 
-            # 4. 检测与高亮
-            min_x, min_y, max_x, max_y = raw_buffer.bounds
+            # 4. 扩大搜索范围 (为了显示附近的灰色点)
+            # 在路线周围扩大 0.1 度 (约10公里) 搜索所有数据
+            search_box = box(min_lon - 0.1, min_lat - 0.1, max_lon + 0.1, max_lat + 0.1)
+            
+            # 筛选出 "视野内" 的所有熊
             candidates = all_bears[
-                (all_bears['longitude'] >= min_x) & (all_bears['longitude'] <= max_x) &
-                (all_bears['latitude'] >= min_y) & (all_bears['latitude'] <= max_y)
+                (all_bears['longitude'] >= search_box.bounds[0]) & 
+                (all_bears['longitude'] <= search_box.bounds[2]) &
+                (all_bears['latitude'] >= search_box.bounds[1]) & 
+                (all_bears['latitude'] <= search_box.bounds[3])
             ]
             
+            nearby_bears_count = len(candidates)
+            debug_info.append(f"🔎 视野范围内(±10km)发现数据: {len(candidates)} 条")
+
+            # 5. 遍历并分类绘制
             for idx, row in candidates.iterrows():
-                # 坐标转为 float 确保不出错
                 bear_lon = float(row['longitude'])
                 bear_lat = float(row['latitude'])
                 bear_pt = Point(bear_lon, bear_lat)
                 
-                if raw_buffer.contains(bear_pt):
+                # 判断是否在 "橙色圈" 内 (危险!)
+                is_danger = raw_buffer.contains(bear_pt)
+                
+                if is_danger:
                     detected_danger.append(row)
                     
-                    # --- 计算指引线 ---
-                    # 找到路线上最近的点
+                    # === 绘制危险点 (红 + 线) ===
+                    # 计算最近连接线
                     nearest_pt_on_route = nearest_points(route_line, bear_pt)[0]
-                    # nearest_pt_on_route.x 是经度(Lon), .y 是纬度(Lat)
-                    
-                    # 连线坐标: [ [Lat1, Lon1], [Lat2, Lon2] ]
-                    line_coords = [
-                        [float(nearest_pt_on_route.y), float(nearest_pt_on_route.x)], 
-                        [bear_lat, bear_lon]
-                    ]
-                    
-                    # A. 画红色连接线 (加粗实线，确保看见)
                     folium.PolyLine(
-                        line_coords,
-                        color="red",
-                        weight=3,        # 加粗
-                        opacity=1,
-                        dash_array='5, 5' # 虚线
+                        [[nearest_pt_on_route.y, nearest_pt_on_route.x], [bear_lat, bear_lon]],
+                        color="red", weight=3, dash_array='5, 5'
                     ).add_to(m)
                     
-                    # B. 画高亮图标 (使用默认图标，不加 prefix，最稳)
-                    date_str = str(row['sighting_datetime'])[:10]
                     folium.Marker(
                         [bear_lat, bear_lon],
-                        popup=f"⚠️ {date_str}<br>{row['sighting_condition']}",
-                        # 使用标准 exclamation-sign，颜色 bright red
-                        icon=folium.Icon(color="red", icon="exclamation-sign"), 
+                        popup=f"⚠️ {str(row['sighting_datetime'])[:10]}",
+                        icon=folium.Icon(color="red", icon="exclamation-sign"),
                         z_index_offset=1000
+                    ).add_to(m)
+                else:
+                    # === 绘制安全但附近的点 (灰) ===
+                    # 强制显示出来，证明数据存在
+                    folium.CircleMarker(
+                        location=[bear_lat, bear_lon],
+                        radius=5,
+                        color="gray",
+                        fill=True,
+                        fill_color="gray",
+                        fill_opacity=0.7,
+                        popup="附近记录 (安全范围内)"
                     ).add_to(m)
 
     except Exception as e:
-        st.error(f"GPX 解析失败: {e}")
-
-# --- 背景点 (仅在未上传GPX时显示) ---
-if not has_gpx and not all_bears.empty:
-    cluster = MarkerCluster().add_to(m)
-    for idx, row in all_bears.head(500).iterrows():
-        folium.Marker(
-            [row['latitude'], row['longitude']],
-            icon=folium.Icon(color="lightgray", icon="info-sign"),
-        ).add_to(cluster)
+        st.error(f"处理失败: {e}")
 
 # ==========================================
 # 4. 渲染地图
@@ -183,21 +187,26 @@ with col1:
     map_html = m._repr_html_()
     components.html(map_html, height=600)
 
-# --- 结果面板 ---
+# --- 诊断面板 ---
 with col2:
-    if has_gpx:
-        st.subheader("📊 检测报告")
+    if uploaded_file:
+        st.subheader("🛠 诊断面板")
+        
+        for msg in debug_info:
+            st.text(msg)
+            
+        st.divider()
+        
         if detected_danger:
-            st.error(f"🔴 发现 {len(detected_danger)} 个危险点")
-            
+            st.error(f"🔴 警报: {len(detected_danger)} 个危险点")
+            # 列表展示
             res_df = pd.DataFrame(detected_danger).sort_values('sighting_datetime', ascending=False)
-            
-            for idx, row in res_df.iterrows():
-                d_str = row['sighting_datetime'].strftime('%Y-%m-%d') if pd.notnull(row['sighting_datetime']) else "未知"
-                with st.expander(f"⚠️ {d_str}", expanded=True):
-                    st.write(f"**详情:** {row['sighting_condition']}")
+            st.dataframe(res_df[['sighting_datetime', 'sighting_condition']], hide_index=True)
+        elif nearby_bears_count > 0:
+            st.warning(f"🟡 附近有 {nearby_bears_count} 条记录，但在预警距离 ({buffer_radius_m}m) 外。")
+            st.caption("尝试调大滑块距离，或检查地图上的灰色点。")
         else:
-            st.success("🟢 路线周边安全")
-            st.caption(f"在 {buffer_radius_m} 米范围内未发现记录。")
+            st.info("⚪ 此区域完全无数据。")
+            st.caption("请确认你的 GPX 路线是否位于【山梨县】境内。")
     else:
-        st.info("👈 请上传 GPX 文件")
+        st.info("👈 请上传 GPX 文件开始诊断")
